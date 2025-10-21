@@ -1,176 +1,140 @@
 """
-Este arquivo define a interface da aplicação usando o framework FastAPI.
-Ele expõe endpoints HTTP para cada uma das funcionalidades principais:
-- Criar um usuário (gerar suas chaves)
-- Enviar uma mensagem
-- Ler as mensagens de um usuário
-- Consultar e verificar o log de auditoria
-
-FastAPI gera automaticamente uma documentação interativa (Swagger UI),
-o que torna a demonstração da API muito mais fácil e visual.
+Esta API agora tem responsabilidades limitadas e bem definidas:
+1.  Gerenciar um diretório de chaves públicas.
+2.  Agir como uma "caixa de correio" para armazenar e entregar envelopes de
+    mensagens criptografadas, sem ter acesso ao seu conteúdo.
 """
 
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
+import uuid
 
-# Importa os módulos de serviço da nossa aplicação
-import key_manager
-import message_service
-import audit_log
+import crypto_service
 import storage_manager
+import audit_log
 
-# Inicializa a aplicação FastAPI
 app = FastAPI(
-    title="Sistema Seguro de Troca de Mensagens",
-    description="Uma API para demonstrar criptografia híbrida, assinaturas digitais e logs de auditoria.",
-    version="1.0.0",
+    title="API do Servidor de Mensagens Seguras",
+    description="Servidor 'Zero-Trust' que gerencia chaves públicas e armazena mensagens criptografadas.",
+    version="2.0.0",
 )
 
 # --- Modelos de Dados (Pydantic) ---
-# Pydantic força a validação dos tipos de dados para requisições e respostas,
-# tornando a API mais robusta.
 
 class CreateUserRequest(BaseModel):
     username: str
 
-class UserResponse(BaseModel):
-    status: str
+class CreateUserResponse(BaseModel):
     username: str
+    private_key_pem: str # Retorna a chave privada para o cliente
+    public_key_pem: str
 
-class SendMessageRequest(BaseModel):
+class PublicKeyResponse(BaseModel):
+    username: str
+    public_key_pem: str
+
+class MessageEnvelope(BaseModel):
+    # O cliente envia este envelope completo para a API
     sender: str
     recipients: List[str]
-    message: str
+    encrypted_payload: Dict[str, str]
+    encrypted_keys: Dict[str, str]
 
-class StatusResponse(BaseModel):
-    status: str
-    details: Optional[str] = None
-
-class ReadMessageResponse(BaseModel):
-    message_id: str
-    sender: Optional[str] = None
-    message: Optional[str] = None
-    timestamp: Optional[str] = None
-    signature_valid: Optional[bool] = None
-    error: Optional[str] = None
-
-class AuditLogEntry(BaseModel):
-    log: Dict[str, Any]
-    signature: str
-    is_valid: Optional[bool] = None
-
-class AuditLogResponse(BaseModel):
-    log_is_valid: bool
-    log: List[AuditLogEntry]
+class StoredMessageResponse(BaseModel):
+    id: str
+    envelope: MessageEnvelope
 
 
 @app.on_event("startup")
 async def startup_event():
-    """
-    Função executada na inicialização da API.
-    Garante que os diretórios e chaves de auditoria existam.
-    """
+    """Inicializa os diretórios da API e as chaves de auditoria."""
     storage_manager.setup_storage()
     audit_log.get_or_create_audit_keys()
-    print("Sistema iniciado e pronto para operar.")
+    print("API do Servidor iniciada.")
 
 
 # --- Endpoints da API ---
 
-@app.post("/create-user",
-          response_model=UserResponse,
+@app.post("/users",
+          response_model=CreateUserResponse,
           status_code=status.HTTP_201_CREATED,
-          summary="Cria um novo usuário e seu par de chaves")
+          summary="Cria um novo usuário e retorna seu par de chaves")
 async def create_user(request: CreateUserRequest):
     """
-    Gera um par de chaves RSA para um novo usuário.
-    - A **chave privada** é salva localmente no servidor (no diretório `keys/`).
-    - A **chave pública** é armazenada no "banco de dados" (`data/public_keys.json`).
+    1.  Verifica se o usuário já existe.
+    2.  Gera um novo par de chaves RSA.
+    3.  Salva a chave PÚBLICA no armazenamento do servidor.
+    4.  Retorna AMBAS as chaves (privada e pública) para o cliente.
+        A API NÃO armazena a chave privada.
     """
-    try:
-        key_manager.create_user_keys(request.username)
-        audit_log.log_event(f"Usuario '{request.username}' criado com sucesso.")
-        return {"status": "success", "username": request.username}
-    except FileExistsError:
+    if request.username in storage_manager.get_public_keys():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Usuario '{request.username}' já existe."
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro inesperado ao criar usuario: {e}"
+            detail=f"Usuário '{request.username}' já existe."
         )
 
-@app.post("/send-message",
-          response_model=StatusResponse,
-          summary="Envia uma mensagem criptografada e assinada")
-async def send_message_endpoint(request: SendMessageRequest):
+    private_key, public_key = crypto_service.generate_rsa_keys()
+    private_key_pem = crypto_service.serialize_private_key(private_key).decode('utf-8')
+    public_key_pem = crypto_service.serialize_public_key(public_key).decode('utf-8')
+
+    storage_manager.save_public_key(request.username, public_key_pem)
+    audit_log.log_event(f"Usuário '{request.username}' criado. Chave pública registrada.")
+
+    return {
+        "username": request.username,
+        "private_key_pem": private_key_pem,
+        "public_key_pem": public_key_pem
+    }
+
+
+@app.get("/keys/{username}",
+         response_model=PublicKeyResponse,
+         summary="Obtém a chave pública de um usuário")
+async def get_public_key(username: str):
     """
-    Implementa o fluxo completo de envio de mensagem segura:
-    1.  A mensagem é assinada com a chave privada do **remetente**.
-    2.  A mensagem assinada é criptografada com uma chave **AES** de uso único.
-    3.  A chave AES é criptografada com a chave pública **RSA** de cada **destinatário**.
-    4.  O pacote final (envelope) é salvo.
+    Permite que clientes busquem a chave pública de outros usuários para poderem
+    enviar mensagens a eles.
     """
-    try:
-        message_service.send_message(
-            sender_username=request.sender,
-            recipient_usernames=request.recipients,
-            plaintext_message=request.message
-        )
-        return {"status": "message sent"}
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro inesperado ao enviar mensagem: {e}"
-        )
+    keys = storage_manager.get_public_keys()
+    if username not in keys:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuário não encontrado.")
+    
+    audit_log.log_event(f"Chave pública para '{username}' solicitada.")
+    return {"username": username, "public_key_pem": keys[username]}
+
+
+@app.post("/messages",
+          status_code=status.HTTP_201_CREATED,
+          summary="Recebe e armazena um envelope de mensagem selado")
+async def store_message(envelope: MessageEnvelope):
+    """
+    Este endpoint simplesmente recebe um envelope de mensagem que já foi
+    totalmente criptografado e assinado no cliente. A API atua como uma
+    caixa de correio, armazenando o envelope sem inspecioná-lo.
+    """
+    message_id = str(uuid.uuid4())
+    storage_manager.save_message(message_id, envelope.dict())
+    audit_log.log_event(f"Mensagem {message_id} de '{envelope.sender}' armazenada para {envelope.recipients}.")
+    return {"status": "message stored", "message_id": message_id}
 
 
 @app.get("/messages/{username}",
-         response_model=List[ReadMessageResponse],
-         summary="Lê todas as mensagens de um usuário")
-async def read_messages_endpoint(username: str):
+         response_model=List[StoredMessageResponse],
+         summary="Busca todos os envelopes de mensagens para um usuário")
+async def get_messages_for_user(username: str):
     """
-    Busca, descriptografa e verifica todas as mensagens destinadas a um usuário.
-    1.  Usa a chave privada do **usuário** para descriptografar a chave de sessão AES.
-    2.  Usa a chave AES para descriptografar a mensagem.
-    3.  Usa a chave pública do **remetente** para verificar a assinatura digital.
+    Retorna todos os envelopes de mensagens brutos onde o `username` está
+    listado como um dos destinatários. A decriptografia ocorrerá no cliente.
     """
-    try:
-        messages = message_service.read_messages(recipient_username=username)
-        return messages
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro inesperado ao ler mensagens: {e}"
-        )
+    all_messages = storage_manager.get_messages()
+    user_messages = []
+    for msg_id, envelope_data in all_messages.items():
+        # A Pydantic fará a validação aqui
+        envelope = MessageEnvelope(**envelope_data)
+        if username in envelope.recipients:
+            user_messages.append({"id": msg_id, "envelope": envelope})
+    
+    audit_log.log_event(f"Mensagens solicitadas por '{username}'. {len(user_messages)} encontradas.")
+    return user_messages
 
-@app.get("/audit-log",
-         response_model=AuditLogResponse,
-         summary="Consulta e verifica o log de auditoria")
-async def get_audit_log(verify: bool = True):
-    """
-    Retorna o log de auditoria. Se `verify=true`, a integridade de cada
-    entrada do log é verificada usando a chave pública de auditoria antes
-    de ser retornada.
-    """
-    try:
-        if verify:
-            is_valid, log_entries = audit_log.verify_and_read_log()
-            return {"log_is_valid": is_valid, "log": log_entries}
-        else:
-            log_entries = audit_log.read_log()
-            return {"log_is_valid": True, "log": log_entries} # Assume válido se não verificado
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro ao processar o log de auditoria: {e}"
-        )

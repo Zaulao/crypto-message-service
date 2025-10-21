@@ -52,3 +52,8 @@ local_settings.py
 
 # MacOS
 .DS_Store
+
+# Application specific
+data_api/
+keys_api/
+secure_message_client/
