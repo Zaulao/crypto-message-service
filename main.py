@@ -4,7 +4,7 @@ Esta API agora tem responsabilidades limitadas e bem definidas:
 2.  Agir como uma "caixa de correio" para armazenar e entregar envelopes de
     mensagens criptografadas, sem ter acesso ao seu conteúdo.
 """
-
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
@@ -13,12 +13,6 @@ import uuid
 import crypto_service
 import storage_manager
 import audit_log
-
-app = FastAPI(
-    title="API do Servidor de Mensagens Seguras",
-    description="Servidor 'Zero-Trust' que gerencia chaves públicas e armazena mensagens criptografadas.",
-    version="2.0.0",
-)
 
 # --- Modelos de Dados (Pydantic) ---
 
@@ -45,13 +39,30 @@ class StoredMessageResponse(BaseModel):
     id: str
     envelope: MessageEnvelope
 
+class AuditLogEntry(BaseModel):
+    log: Dict[str, Any]
+    signature: str
+    is_valid: Optional[bool] = None
 
-@app.on_event("startup")
-async def startup_event():
+class AuditLogResponse(BaseModel):
+    log_is_valid: bool
+    log: List[AuditLogEntry]
+
+# --- Inicialização da API ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     """Inicializa os diretórios da API e as chaves de auditoria."""
     storage_manager.setup_storage()
     audit_log.get_or_create_audit_keys()
     print("API do Servidor iniciada.")
+    yield
+
+app = FastAPI(
+    title="API do Servidor de Mensagens Seguras",
+    description="Servidor 'Zero-Trust' que gerencia chaves públicas e armazena mensagens criptografadas.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 # --- Endpoints da API ---
@@ -79,7 +90,7 @@ async def create_user(request: CreateUserRequest):
     public_key_pem = crypto_service.serialize_public_key(public_key).decode('utf-8')
 
     storage_manager.save_public_key(request.username, public_key_pem)
-    audit_log.log_event(f"Usuário '{request.username}' criado. Chave pública registrada.")
+    audit_log.log_event(f"Usuario '{request.username}' criado. Chave pública registrada.")
 
     return {
         "username": request.username,
@@ -98,9 +109,9 @@ async def get_public_key(username: str):
     """
     keys = storage_manager.get_public_keys()
     if username not in keys:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuário não encontrado.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario não encontrado.")
     
-    audit_log.log_event(f"Chave pública para '{username}' solicitada.")
+    audit_log.log_event(f"Chave publica para '{username}' solicitada.")
     return {"username": username, "public_key_pem": keys[username]}
 
 
@@ -138,3 +149,20 @@ async def get_messages_for_user(username: str):
     audit_log.log_event(f"Mensagens solicitadas por '{username}'. {len(user_messages)} encontradas.")
     return user_messages
 
+@app.get("/audit-log",
+         response_model=AuditLogResponse,
+         summary="Consulta e verifica o log de auditoria")
+async def get_audit_log(verify: bool = True):
+    """
+    Retorna o log de auditoria. Se `verify=true`, a integridade de cada
+    entrada do log é verificada usando a chave pública de auditoria antes
+    de ser retornada.
+    """
+    try:
+        is_valid, log_entries = audit_log.verify_and_read_log()
+        return {"log_is_valid": is_valid, "log": log_entries}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao processar o log de auditoria: {e}"
+        )
