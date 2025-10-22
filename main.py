@@ -90,7 +90,7 @@ async def create_user(request: CreateUserRequest):
     public_key_pem = crypto_service.serialize_public_key(public_key).decode('utf-8')
 
     storage_manager.save_public_key(request.username, public_key_pem)
-    audit_log.log_event(f"Usuario '{request.username}' criado. Chave pública registrada.")
+    audit_log.log_event(f"Usuario '{request.username}' criado. Chave publica registrada.")
 
     return {
         "username": request.username,
