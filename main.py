@@ -125,7 +125,7 @@ async def store_message(envelope: MessageEnvelope):
     caixa de correio, armazenando o envelope sem inspecioná-lo.
     """
     message_id = str(uuid.uuid4())
-    storage_manager.save_message(message_id, envelope.dict())
+    storage_manager.save_message(message_id, envelope.model_dump())
     audit_log.log_event(f"Mensagem {message_id} de '{envelope.sender}' armazenada para {envelope.recipients}.")
     return {"status": "message stored", "message_id": message_id}
 
