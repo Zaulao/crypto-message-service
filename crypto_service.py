@@ -97,15 +97,6 @@ def decrypt_aes_gcm(ciphertext: bytes, key: bytes, iv: bytes, tag: bytes) -> byt
     ciphertext_with_tag = ciphertext + tag
     return aesgcm.decrypt(iv, ciphertext_with_tag, None)
 
-
-# --- Funções de Hash (SHA-256) ---
-
-def hash_sha256(data: bytes) -> bytes:
-    """Calcula o hash SHA-256 de um conjunto de dados."""
-    digest = hashes.Hash(hashes.SHA256())
-    digest.update(data)
-    return digest.finalize()
-
 # --- Assinatura Digital (RSA-PSS) ---
 
 def sign_data(data: bytes, private_key) -> bytes:
